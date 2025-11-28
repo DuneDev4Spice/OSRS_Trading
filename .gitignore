@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+osrs_v2_venv/
+
+# Databases
+*.db
+
+# macOS
+.DS_Store
+

@@ -7,8 +7,7 @@ computes simple flip stats:
 
 - current_high
 - current_low
-- spread  (current_high - current_low)
-- margin  (same as spread)
+- Margin  (current_high - current_low)
 - roi_pct (margin / current_low * 100)
 
 Then shows the top N items by margin.
@@ -120,7 +119,6 @@ class GlobalFlipFinder:
 
         - current_high
         - current_low
-        - spread
         - margin
         - roi_pct
 
@@ -138,9 +136,8 @@ class GlobalFlipFinder:
         # Drop rows with missing or non-positive lows
         df = df[df["current_low"] > 0]
 
-        # Basic spread and margin
-        df["spread"] = df["current_high"] - df["current_low"]
-        df["margin"] = df["spread"]
+        # Basic margin
+        df["margin"] = df["current_high"] - df["current_low"]
 
         # Only keep positive margins
         df = df[df["margin"] > 0]
@@ -157,7 +154,6 @@ class GlobalFlipFinder:
                 "name",
                 "current_high",
                 "current_low",
-                "spread",
                 "margin",
                 "roi_pct",
             ]
@@ -181,7 +177,7 @@ def format_table_for_print(df: pd.DataFrame) -> str:
     """
     df2 = df.copy()
 
-    int_cols = ["current_high", "current_low", "spread", "margin"]
+    int_cols = ["current_high", "current_low", "margin"]
     for col in int_cols:
         if col in df2.columns:
             df2[col] = df2[col].apply(

@@ -1,3 +1,19 @@
+#!/usr/bin/env python3
+"""
+Global flip finder for OSRS.
+
+Reads the latest price snapshot per item from osrs_prices.db and
+computes simple flip stats:
+
+- current_high
+- current_low
+- spread  (current_high - current_low)
+- margin  (same as spread)
+- roi_pct (margin / current_low * 100)
+
+Then shows the top N items by margin.
+"""
+
 from __future__ import annotations
 
 import sqlite3
@@ -11,20 +27,7 @@ DEFAULT_DB_PATH = Path(__file__).with_name("osrs_prices.db")
 
 
 class GlobalFlipFinder:
-    """
-    Scan all items and compute flip stats over a recent time window.
-
-    For each item, we compute:
-      - current high / low / spread
-      - average spread
-      - max spread
-      - buy_zone  ~ 25% quantile of low
-      - sell_zone ~ 75% quantile of high
-      - margin    = sell_zone - buy_zone
-      - roi       = margin / buy_zone
-
-    Then we sort by margin and show the top N candidates.
-    """
+    """Compute simple flip stats from the latest prices in the DB."""
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self.db_path = Path(db_path)
@@ -32,12 +35,13 @@ class GlobalFlipFinder:
         self.conn.row_factory = sqlite3.Row
 
     # ------------------------------------------------------------------ #
-    # Core data extraction                                               #
+    # Helpers                                                            #
     # ------------------------------------------------------------------ #
 
-    def _get_window_bounds(self, since_minutes: int) -> Optional[int]:
+    def _get_window_start(self, since_minutes: int) -> Optional[int]:
         """
-        Find the global latest scan_ts and compute window start.
+        Get the earliest scan_ts we care about based on the most recent
+        timestamp in the prices table.
 
         Returns:
             window_start (int) or None if prices table is empty.
@@ -47,184 +51,157 @@ class GlobalFlipFinder:
         row = cur.fetchone()
         if not row or row["max_ts"] is None:
             return None
+
         max_ts = row["max_ts"]
         return max_ts - since_minutes * 60
 
-    def load_window_dataframe(self, since_minutes: int = 240) -> pd.DataFrame:
+    def load_latest_snapshot(self, since_minutes: int = 240) -> pd.DataFrame:
         """
-        Load all price samples in the recent window, joined with item info.
+        Load the latest price row per item within the recent window.
+
+        Returns:
+            DataFrame with columns:
+              item_id, name, current_high, current_low
         """
-        window_start = self._get_window_bounds(since_minutes)
+        window_start = self._get_window_start(since_minutes)
         if window_start is None:
             return pd.DataFrame()
 
-        cur = self.conn.cursor()
-        cur.execute(
-            """
+        # Subquery to pick the latest scan_ts per item in the window
+        query = """
             SELECT
                 p.item_id,
                 p.scan_ts,
                 p.high,
                 p.low,
-                i.name,
-                i.members,
-                i."limit",
-                i.value
+                i.name
             FROM prices p
-            JOIN items i ON p.item_id = i.id
-            WHERE p.scan_ts >= ?
-              AND p.high IS NOT NULL
+            JOIN (
+                SELECT item_id, MAX(scan_ts) AS max_ts
+                FROM prices
+                WHERE scan_ts >= ?
+                GROUP BY item_id
+            ) latest
+              ON p.item_id = latest.item_id
+             AND p.scan_ts = latest.max_ts
+            JOIN items i
+              ON p.item_id = i.id
+            WHERE p.high IS NOT NULL
               AND p.low  IS NOT NULL
-            """,
-            (window_start,),
-        )
+        """
+
+        cur = self.conn.cursor()
+        cur.execute(query, (window_start,))
         rows = cur.fetchall()
         if not rows:
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows, columns=["item_id", "scan_ts", "high", "low", "name", "members", "limit", "value"])
-        df["spread"] = df["high"] - df["low"]
+        df = pd.DataFrame(
+            rows,
+            columns=["item_id", "scan_ts", "high", "low", "name"],
+        )
+
+        df = df.rename(
+            columns={
+                "high": "current_high",
+                "low": "current_low",
+            }
+        )
+
         return df
 
     # ------------------------------------------------------------------ #
-    # Flip stats per item                                                #
+    # Flip stats                                                         #
     # ------------------------------------------------------------------ #
 
     def compute_flip_table(self, since_minutes: int = 240) -> pd.DataFrame:
         """
-        Compute flip-oriented stats for all items in the window.
+        Compute simple flip stats for all items:
+
+        - current_high
+        - current_low
+        - spread
+        - margin
+        - roi_pct
 
         Returns:
-            DataFrame with one row per item, including:
-              name, current_high, current_low, current_spread,
-              avg_spread, max_spread, buy_zone, sell_zone,
-              margin, roi_pct, limit, samples
+            DataFrame sorted by margin descending.
         """
-        df = self.load_window_dataframe(since_minutes)
+        df = self.load_latest_snapshot(since_minutes=since_minutes)
         if df.empty:
             return pd.DataFrame()
 
-        # --- Current snapshot (latest scan_ts per item) ---
-        idx_latest = df.groupby("item_id")["scan_ts"].idxmax()
-        current = df.loc[idx_latest, ["item_id", "high", "low", "spread"]].rename(
-            columns={
-                "high": "current_high",
-                "low": "current_low",
-                "spread": "current_spread",
-            }
-        )
+        # Ensure numeric types
+        df["current_high"] = pd.to_numeric(df["current_high"], errors="coerce")
+        df["current_low"] = pd.to_numeric(df["current_low"], errors="coerce")
 
-        # --- Aggregated stats per item ---
-        agg = (
-            df.groupby("item_id")
-            .agg(
-                avg_spread=("spread", "mean"),
-                max_spread=("spread", "max"),
-                min_low=("low", "min"),
-                max_high=("high", "max"),
-                samples=("scan_ts", "count"),
-            )
-        )
+        # Drop rows with missing or non-positive lows
+        df = df[df["current_low"] > 0]
 
-        # --- Quantile-based zones (buy/sell) ---
-        buy_zone = df.groupby("item_id")["low"].quantile(0.25).rename("buy_zone")
-        sell_zone = df.groupby("item_id")["high"].quantile(0.75).rename("sell_zone")
+        # Basic spread and margin
+        df["spread"] = df["current_high"] - df["current_low"]
+        df["margin"] = df["spread"]
 
-        # --- Basic item metadata (name, limit, etc.) ---
-        meta = (
-            df.groupby("item_id")
-            .agg(
-                name=("name", "first"),
-                members=("members", "first"),
-                limit=("limit", "first"),
-                value=("value", "first"),
-            )
-        )
+        # Only keep positive margins
+        df = df[df["margin"] > 0]
 
-        # Merge everything together
-        out = (
-            meta
-            .join(agg)
-            .join(current.set_index("item_id"))
-            .join(buy_zone)
-            .join(sell_zone)
-        )
+        # ROI as percentage
+        df["roi_pct"] = df["margin"] / df["current_low"] * 100.0
 
-        # Compute margins & ROI
-        out["margin"] = out["sell_zone"] - out["buy_zone"]
-        # Guard against divide-by-zero
-        out = out[out["buy_zone"] > 0]
-        out["roi_pct"] = out["margin"] / out["buy_zone"] * 100
+        # Sort by margin (biggest absolute GP flips first)
+        df = df.sort_values("margin", ascending=False)
 
-        # Clean up types / rounding a bit
-        for col in ["avg_spread", "max_spread", "buy_zone", "sell_zone", "margin", "current_high", "current_low", "current_spread"]:
-            out[col] = out[col].round(1)
-
-        out["roi_pct"] = out["roi_pct"].round(2)
-
-        # Filter out items with non-positive margin or too few samples
-        out = out[(out["margin"] > 0) & (out["samples"] >= 5)]
-
-        # Sort by margin (biggest flips at top)
-        out = out.sort_values("margin", ascending=False)
-
-        # Move columns into a nice order
-        out = out[
+        # Final column order
+        df = df[
             [
                 "name",
-                "members",
-                "limit",
-                "samples",
                 "current_high",
                 "current_low",
-                "current_spread",
-                "avg_spread",
-                "max_spread",
-                "buy_zone",
-                "sell_zone",
+                "spread",
                 "margin",
                 "roi_pct",
             ]
         ]
 
-        return out.reset_index(drop=True)
+        return df.reset_index(drop=True)
 
     def close(self) -> None:
+        """Close the DB connection."""
         self.conn.close()
+
+
+# ---------------------------------------------------------------------- #
+# Pretty printing                                                        #
+# ---------------------------------------------------------------------- #
+
 
 def format_table_for_print(df: pd.DataFrame) -> str:
     """
-    Pretty-print numeric columns using commas and decimals,
-    safely handling NaNs.
+    Pretty-print numeric columns with commas and decimal formatting.
     """
     df2 = df.copy()
 
-    # Integer-like columns: add commas, but skip NaNs
-    int_cols = [
-        "limit", "samples",
-        "current_high", "current_low", "current_spread",
-        "avg_spread", "max_spread",
-        "buy_zone", "sell_zone", "margin",
-    ]
+    int_cols = ["current_high", "current_low", "spread", "margin"]
     for col in int_cols:
         if col in df2.columns:
             df2[col] = df2[col].apply(
                 lambda x: "" if pd.isna(x) else f"{int(x):,}"
             )
 
-    # ROI as percentage w/ two decimals, skip NaNs
     if "roi_pct" in df2.columns:
         df2["roi_pct"] = df2["roi_pct"].apply(
             lambda x: "" if pd.isna(x) else f"{float(x):.2f}%"
         )
 
-    # Names left-aligned (for visual clarity)
     if "name" in df2.columns:
         df2["name"] = df2["name"].astype(str)
 
     return df2.to_string(index=False)
 
 
+# ---------------------------------------------------------------------- #
+# CLI                                                                    #
+# ---------------------------------------------------------------------- #
 
 
 def main() -> None:
@@ -255,17 +232,14 @@ def main() -> None:
             print("No data available in the selected window.")
             return
 
-        # Show just the top N
-        print(f"\n=== Top {top_n} flip candidates over last {window} minutes ===\n")
+        print(
+            f"\n=== Top {top_n} flip candidates "
+            f"over last {window} minutes ===\n"
+        )
         pretty = format_table_for_print(table.head(top_n))
         print(pretty)
-
-
     finally:
         finder.close()
-
-
-
 
 
 if __name__ == "__main__":

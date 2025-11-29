@@ -194,35 +194,36 @@ class GlobalFlipFinder:
 
 def format_table_for_print(df: pd.DataFrame) -> str:
     """
-    Return a pretty-printed string version of the flip table
-    with commas, decimals, and aligned columns.
+    Pretty-print numeric columns using commas and decimals,
+    safely handling NaNs.
     """
-
     df2 = df.copy()
 
-    # Format integers with commas
+    # Integer-like columns: add commas, but skip NaNs
     int_cols = [
         "limit", "samples",
         "current_high", "current_low", "current_spread",
         "avg_spread", "max_spread",
-        "buy_zone", "sell_zone", "margin"
+        "buy_zone", "sell_zone", "margin",
     ]
     for col in int_cols:
         if col in df2.columns:
-            df2[col] = df2[col].apply(lambda x: f"{int(x):,}")
+            df2[col] = df2[col].apply(
+                lambda x: "" if pd.isna(x) else f"{int(x):,}"
+            )
 
-    # Format ROI percentage
+    # ROI as percentage w/ two decimals, skip NaNs
     if "roi_pct" in df2.columns:
         df2["roi_pct"] = df2["roi_pct"].apply(
-            lambda x: f"{float(x):.2f}%"
+            lambda x: "" if pd.isna(x) else f"{float(x):.2f}%"
         )
 
-    # Left-align item names
+    # Names left-aligned (for visual clarity)
     if "name" in df2.columns:
         df2["name"] = df2["name"].astype(str)
 
-    # Build final aligned table string
     return df2.to_string(index=False)
+
 
 
 

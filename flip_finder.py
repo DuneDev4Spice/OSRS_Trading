@@ -192,6 +192,39 @@ class GlobalFlipFinder:
     def close(self) -> None:
         self.conn.close()
 
+def format_table_for_print(df: pd.DataFrame) -> str:
+    """
+    Return a pretty-printed string version of the flip table
+    with commas, decimals, and aligned columns.
+    """
+
+    df2 = df.copy()
+
+    # Format integers with commas
+    int_cols = [
+        "limit", "samples",
+        "current_high", "current_low", "current_spread",
+        "avg_spread", "max_spread",
+        "buy_zone", "sell_zone", "margin"
+    ]
+    for col in int_cols:
+        if col in df2.columns:
+            df2[col] = df2[col].apply(lambda x: f"{int(x):,}")
+
+    # Format ROI percentage
+    if "roi_pct" in df2.columns:
+        df2["roi_pct"] = df2["roi_pct"].apply(
+            lambda x: f"{float(x):.2f}%"
+        )
+
+    # Left-align item names
+    if "name" in df2.columns:
+        df2["name"] = df2["name"].astype(str)
+
+    # Build final aligned table string
+    return df2.to_string(index=False)
+
+
 
 def main() -> None:
     finder = GlobalFlipFinder()
@@ -223,10 +256,15 @@ def main() -> None:
 
         # Show just the top N
         print(f"\n=== Top {top_n} flip candidates over last {window} minutes ===\n")
-        print(table.head(top_n).to_string(index=False))
+        pretty = format_table_for_print(table.head(top_n))
+        print(pretty)
+
 
     finally:
         finder.close()
+
+
+
 
 
 if __name__ == "__main__":
